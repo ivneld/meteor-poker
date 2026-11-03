@@ -1,4 +1,4 @@
-import { randomBytes } from 'node:crypto';
+import { randomBytes, scryptSync, timingSafeEqual } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import http from 'node:http';
 import { networkInterfaces } from 'node:os';
@@ -11,6 +11,8 @@ const PUBLIC_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), 'publ
 const STATIC_FILES = {
   '/app.js': ['app.js', 'text/javascript; charset=utf-8'],
   '/style.css': ['style.css', 'text/css; charset=utf-8'],
+  '/fire.js': ['fire.js', 'text/javascript; charset=utf-8'],
+  '/meteor.png': ['meteor.png', 'image/png'],
 };
 
 export const DECKS = {
@@ -21,6 +23,9 @@ export const DECKS = {
 };
 
 const MAX_NAME_LENGTH = 20;
+const MAX_ROOM_NAME_LENGTH = 30;
+const MAX_PASSWORD_LENGTH = 64;
+const MAX_BODY_BYTES = 4096;
 const MAX_CARD_LENGTH = 3;
 const MAX_CUSTOM_CARDS = 20;
 const HEARTBEAT_MS = 15_000;
@@ -28,8 +33,31 @@ const SWEEP_MS = 60_000;
 
 const sliceChars = (value, length) => [...value].slice(0, length).join('');
 
-function parseName(value) {
-  return typeof value === 'string' ? sliceChars(value.trim(), MAX_NAME_LENGTH) : '';
+function parseName(value, length = MAX_NAME_LENGTH) {
+  return typeof value === 'string' ? sliceChars(value.trim(), length) : '';
+}
+
+function hashPassword(password) {
+  const salt = randomBytes(16);
+  return { salt, hash: scryptSync(password, salt, 32) };
+}
+
+function verifyPassword({ salt, hash }, password) {
+  if (typeof password !== 'string' || password.length > MAX_PASSWORD_LENGTH) return false;
+  return timingSafeEqual(scryptSync(password, salt, 32), hash);
+}
+
+async function readJson(req) {
+  let body = '';
+  for await (const chunk of req) {
+    body += chunk;
+    if (body.length > MAX_BODY_BYTES) return null;
+  }
+  try {
+    return body ? JSON.parse(body) : {};
+  } catch {
+    return null;
+  }
 }
 
 function parseCustomDeck(value) {
@@ -81,10 +109,10 @@ function publicBase(req, port) {
   return `${protocol}://${host}`;
 }
 
-export function createApp({ graceMs = 60_000, emptyRoomMs = 30 * 60_000 } = {}) {
+export function createApp({ graceMs = 60_000, emptyRoomMs = 30 * 60_000, wrongPasswordDelayMs = 1000 } = {}) {
   const rooms = new Map();
 
-  function createRoom() {
+  function createRoom({ name, password }) {
     if (rooms.size >= 9000) return null;
     let id;
     do {
@@ -92,6 +120,9 @@ export function createApp({ graceMs = 60_000, emptyRoomMs = 30 * 60_000 } = {}) 
     } while (rooms.has(id));
     const room = {
       id,
+      name: parseName(name, MAX_ROOM_NAME_LENGTH) || `방 ${id}`,
+      password: password ? hashPassword(password) : null,
+      createdAt: Date.now(),
       deckId: 'standard',
       deck: DECKS.standard,
       hostOnly: false,
@@ -104,12 +135,20 @@ export function createApp({ graceMs = 60_000, emptyRoomMs = 30 * 60_000 } = {}) 
     return room;
   }
 
+  const summaryOf = (room) => ({
+    id: room.id,
+    name: room.name,
+    locked: room.password !== null,
+    participants: room.participants.size,
+  });
+
   function stateFor(room, participant) {
     const participants = [...room.participants.values()];
     return {
       type: 'state',
       room: {
         id: room.id,
+        name: room.name,
         joinUrl: `${participant.base}/r/${room.id}`,
         deck: room.deck,
         deckId: room.deckId,
@@ -228,14 +267,24 @@ export function createApp({ graceMs = 60_000, emptyRoomMs = 30 * 60_000 } = {}) 
 
     try {
       if (req.method === 'POST' && pathname === '/api/rooms') {
-        const room = createRoom();
-        return room ? sendJson(201, { id: room.id }) : sendJson(503, { error: 'no_rooms_available' });
+        const body = await readJson(req);
+        const valid = body
+          && (body.name === undefined || typeof body.name === 'string')
+          && (body.password === undefined || (typeof body.password === 'string' && body.password.length <= MAX_PASSWORD_LENGTH));
+        if (!valid) return sendJson(400, { error: 'invalid_request' });
+        const room = createRoom(body);
+        return room ? sendJson(201, summaryOf(room)) : sendJson(503, { error: 'no_rooms_available' });
       }
       if (req.method !== 'GET') return sendJson(405, { error: 'method_not_allowed' });
 
+      if (pathname === '/api/rooms') {
+        return sendJson(200, [...rooms.values()].sort((a, b) => b.createdAt - a.createdAt).map(summaryOf));
+      }
+
       const roomMatch = pathname.match(/^\/api\/rooms\/(\d{4})$/);
       if (roomMatch) {
-        return rooms.has(roomMatch[1]) ? sendJson(200, { id: roomMatch[1] }) : sendJson(404, { error: 'room_not_found' });
+        const room = rooms.get(roomMatch[1]);
+        return room ? sendJson(200, summaryOf(room)) : sendJson(404, { error: 'room_not_found' });
       }
 
       const qrMatch = pathname.match(/^\/qr\/(\d{4})\.svg$/);
@@ -271,10 +320,12 @@ export function createApp({ graceMs = 60_000, emptyRoomMs = 30 * 60_000 } = {}) 
 
     const base = publicBase(req, server.address().port);
     let participant = null;
+    let denied = false;
     ws.isAlive = true;
     ws.on('pong', () => { ws.isAlive = true; });
 
     ws.on('message', (data) => {
+      if (denied) return;
       let message;
       try {
         message = JSON.parse(data);
@@ -282,6 +333,13 @@ export function createApp({ graceMs = 60_000, emptyRoomMs = 30 * 60_000 } = {}) 
         return;
       }
       if (message?.type === 'join') {
+        // 이미 방에 있는 참가자의 재접속은 비밀번호를 다시 묻지 않는다.
+        const known = participant || room.participants.has(message.clientId);
+        if (!known && room.password && !verifyPassword(room.password, message.password)) {
+          denied = true;
+          setTimeout(() => ws.close(4003, 'wrong_password'), wrongPasswordDelayMs);
+          return;
+        }
         participant = join(ws, room, base, message) ?? participant;
         if (participant) broadcast(room);
         return;

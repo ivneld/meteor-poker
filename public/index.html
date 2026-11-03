@@ -3,43 +3,62 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-  <meta name="theme-color" content="#1f6a7d">
-  <title>스크럼 포커</title>
-  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect x='6' y='2' width='20' height='28' rx='4' fill='%231f6a7d'/><text x='16' y='22' font-size='16' font-family='sans-serif' font-weight='700' text-anchor='middle' fill='white'>5</text></svg>">
+  <meta name="theme-color" content="#170704">
+  <title>메테오 포커</title>
+  <link rel="icon" href="/meteor.png">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Black+Han+Sans&display=swap">
   <link rel="stylesheet" href="/style.css">
 </head>
 <body>
+  <canvas id="fire" class="fire" aria-hidden="true"></canvas>
+
   <main id="home" class="home" hidden>
-    <div class="fan" aria-hidden="true">
-      <span>1</span><span>3</span><span>5</span><span>8</span>
+    <div class="meteor">
+      <img src="/meteor.png" alt="" width="148" height="148">
     </div>
-    <h1>스크럼 포커</h1>
+    <h1>메테오 포커</h1>
     <p class="lead">가입 없이 바로 방을 만들고, 링크나 QR로 팀을 불러 함께 추정하세요.</p>
-    <button id="create-room" class="primary" type="button">방 만들기</button>
-    <form id="enter-room" class="enter">
-      <label for="room-input">방 번호로 입장</label>
-      <div class="enter-row">
-        <input id="room-input" inputmode="numeric" pattern="\d{4}" maxlength="4" placeholder="1234" autocomplete="off" required>
-        <button type="submit">입장</button>
-      </div>
-    </form>
     <p id="home-error" class="error" role="alert" hidden></p>
+
+    <div class="home-panels">
+      <section class="panel" aria-labelledby="rooms-title">
+        <h2 id="rooms-title">열린 방</h2>
+        <ul id="room-list" class="room-list"></ul>
+        <p id="room-empty" class="hint" hidden>열린 방이 없습니다. 새 방을 만들어 팀원을 초대하세요.</p>
+      </section>
+
+      <form id="create-form" class="panel" aria-labelledby="create-title">
+        <h2 id="create-title">새 방 만들기</h2>
+        <label for="room-name">방 이름</label>
+        <input id="room-name" maxlength="30" placeholder="예: 결제팀 스프린트 12" autocomplete="off">
+        <label for="room-password">비밀번호 (선택)</label>
+        <input id="room-password" type="password" maxlength="64" autocomplete="new-password">
+        <p class="hint">비워두면 누구나 들어올 수 있습니다.</p>
+        <button id="create-room" class="primary" type="submit">방 만들기</button>
+      </form>
+    </div>
   </main>
 
-  <main id="name-view" class="home" hidden>
+  <main id="name-view" class="home entry" hidden>
     <h1 id="name-title"></h1>
     <form id="name-form" class="enter">
       <label for="name-input">팀원들에게 보일 이름</label>
-      <div class="enter-row">
-        <input id="name-input" maxlength="20" autocomplete="nickname" required>
-        <button class="primary" type="submit">입장</button>
+      <input id="name-input" maxlength="20" autocomplete="nickname" required>
+      <div id="password-field" hidden>
+        <label for="password-input">비밀번호</label>
+        <input id="password-input" type="password" maxlength="64" autocomplete="current-password">
       </div>
+      <p id="entry-error" class="error" role="alert" hidden></p>
+      <button class="primary" type="submit">입장</button>
+      <a class="back" href="/">방 목록으로</a>
     </form>
   </main>
 
   <div id="room-view" class="room" hidden>
     <header class="bar">
-      <a class="brand" href="/">스크럼 포커</a>
+      <a class="brand" href="/">메테오 포커</a>
       <span id="room-label" class="room-label"></span>
       <button id="rename" class="link" type="button"></button>
       <button id="invite-toggle" class="invite-toggle" type="button">팀원 초대</button>

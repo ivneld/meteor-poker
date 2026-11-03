@@ -3,37 +3,47 @@ import { after, before, test } from 'node:test';
 import { WebSocket } from 'ws';
 import { createApp, summarize } from '../server.js';
 
-let app;
-let base;
-let port;
+async function startServer(options) {
+  const app = createApp({ wrongPasswordDelayMs: 0, ...options });
+  await new Promise((resolve) => app.server.listen(0, '127.0.0.1', resolve));
+  const { port } = app.server.address();
+  return { app, port, base: `http://127.0.0.1:${port}` };
+}
+
+// 연결이 끊긴 참가자가 빨리 빠지도록 유예를 짧게 둔 서버
+let server;
+// 유예가 짧으면 나가기 없이도 빠지므로, 나가기는 유예가 긴 서버에서 확인한다.
+let longGraceServer;
 
 before(async () => {
-  app = createApp({ graceMs: 100 });
-  await new Promise((resolve) => app.server.listen(0, '127.0.0.1', resolve));
-  port = app.server.address().port;
-  base = `http://127.0.0.1:${port}`;
+  server = await startServer({ graceMs: 100 });
+  longGraceServer = await startServer({ graceMs: 60_000 });
 });
 
-after(() => app.close());
+after(() => Promise.all([server.app.close(), longGraceServer.app.close()]));
 
-async function createRoom() {
-  const response = await fetch(`${base}/api/rooms`, { method: 'POST' });
+async function createRoom(body, target = server) {
+  const response = await fetch(`${target.base}/api/rooms`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: body && JSON.stringify(body),
+  });
   assert.equal(response.status, 201);
   return (await response.json()).id;
 }
 
 class Player {
-  constructor(roomId, clientId, name) {
+  constructor(roomId, clientId, name, password, target = server) {
     this.states = [];
     this.waiters = [];
-    this.ws = new WebSocket(`ws://127.0.0.1:${port}/ws?room=${roomId}`);
+    this.ws = new WebSocket(`ws://127.0.0.1:${target.port}/ws?room=${roomId}`);
     this.ws.on('message', (data) => {
       this.states.push(JSON.parse(data));
       this.waiters.splice(0).forEach((resolve) => resolve());
     });
     this.closed = new Promise((resolve) => this.ws.on('close', resolve));
     this.ready = new Promise((resolve) => this.ws.on('open', () => {
-      this.send({ type: 'join', clientId, name });
+      this.send({ type: 'join', clientId, name, password });
       resolve();
     }));
   }
@@ -54,10 +64,12 @@ class Player {
   }
 }
 
-async function seat(roomId, ...names) {
+const seat = (roomId, ...names) => seatOn(server, roomId, ...names);
+
+async function seatOn(target, roomId, ...names) {
   const players = [];
   for (const name of names) {
-    const player = new Player(roomId, `client-${name}-${roomId}`, name);
+    const player = new Player(roomId, `client-${name}-${roomId}`, name, undefined, target);
     await player.ready;
     await player.until((state) => state.participants.some((other) => other.name === name));
     players.push(player);
@@ -175,13 +187,56 @@ test('방장이 떠나면 남은 참가자가 방장이 된다', async () => {
   assert.equal(state.you.isHost, true);
 });
 
-test('나가기를 누르면 유예 없이 바로 빠지고 방장이 넘어간다', async () => {
-  // 유예 시간이 짧으면 나가기 없이도 빠지므로, 유예가 긴 서버로 바꿔서 확인한다.
-  await app.close();
-  app = createApp({ graceMs: 60_000 });
-  await new Promise((resolve) => app.server.listen(port, '127.0.0.1', resolve));
+test('방 목록은 이름, 인원, 잠금 여부만 알려준다', async () => {
+  const openId = await createRoom({ name: '  결제팀 스프린트  ' });
+  const lockedId = await createRoom({ password: 'secret' });
+  await seat(openId, 'alice');
 
-  const [host, guest] = await seat(await createRoom(), 'host', 'guest');
+  const rooms = await (await fetch(`${server.base}/api/rooms`)).json();
+  const open = rooms.find((room) => room.id === openId);
+  const locked = rooms.find((room) => room.id === lockedId);
+  assert.deepEqual(open, { id: openId, name: '결제팀 스프린트', locked: false, participants: 1 });
+  assert.deepEqual(locked, { id: lockedId, name: `방 ${lockedId}`, locked: true, participants: 0 });
+  assert.ok(rooms.indexOf(locked) < rooms.indexOf(open), '최근에 만든 방이 먼저 나온다');
+  assert.doesNotMatch(JSON.stringify(rooms), /secret|salt|hash/);
+});
+
+test('잘못된 방 생성 요청은 400', async () => {
+  for (const body of ['{', JSON.stringify({ password: 1 }), JSON.stringify({ password: 'x'.repeat(65) })]) {
+    const response = await fetch(`${server.base}/api/rooms`, { method: 'POST', body });
+    assert.equal(response.status, 400);
+  }
+});
+
+test('비밀번호가 걸린 방은 틀린 비밀번호로 들어갈 수 없다', async () => {
+  const roomId = await createRoom({ password: 'secret' });
+  for (const password of [undefined, '', 'wrong']) {
+    const intruder = new Player(roomId, `intruder-${password}`, 'intruder', password);
+    assert.equal(await intruder.closed, 4003);
+    assert.equal(intruder.states.length, 0);
+  }
+
+  const member = new Player(roomId, 'member', 'member', 'secret');
+  await member.ready;
+  const state = await member.until((current) => named(current, 'member'));
+  assert.equal(state.participants.length, 1);
+});
+
+test('비밀번호 방에 이미 있는 참가자는 비밀번호 없이 재접속한다', async () => {
+  const roomId = await createRoom({ password: 'secret' });
+  const first = new Player(roomId, 'member', 'member', 'secret');
+  await first.ready;
+  await first.until((state) => named(state, 'member'));
+  first.ws.terminate();
+
+  const again = new Player(roomId, 'member', 'member');
+  await again.ready;
+  const state = await again.until((current) => named(current, 'member')?.online);
+  assert.equal(state.participants.length, 1);
+});
+
+test('나가기를 누르면 유예 없이 바로 빠지고 방장이 넘어간다', async () => {
+  const [host, guest] = await seatOn(longGraceServer, await createRoom(undefined, longGraceServer), 'host', 'guest');
   host.send({ type: 'leave' });
   assert.equal(await host.closed, 1000);
   const state = await guest.until((current) => current.participants.length === 1);
@@ -189,15 +244,15 @@ test('나가기를 누르면 유예 없이 바로 빠지고 방장이 넘어간�
 });
 
 test('없는 방은 404이고 소켓은 4004로 닫힌다', async () => {
-  assert.equal((await fetch(`${base}/api/rooms/0000`)).status, 404);
-  assert.equal((await fetch(`${base}/qr/0000.svg`)).status, 404);
-  const ws = new WebSocket(`ws://127.0.0.1:${port}/ws?room=0000`);
+  assert.equal((await fetch(`${server.base}/api/rooms/0000`)).status, 404);
+  assert.equal((await fetch(`${server.base}/qr/0000.svg`)).status, 404);
+  const ws = new WebSocket(`ws://127.0.0.1:${server.port}/ws?room=0000`);
   assert.equal(await new Promise((resolve) => ws.on('close', resolve)), 4004);
 });
 
 test('QR은 SVG로 제공되고 공유 링크는 localhost가 아니다', async () => {
   const roomId = await createRoom();
-  const response = await fetch(`${base}/qr/${roomId}.svg`);
+  const response = await fetch(`${server.base}/qr/${roomId}.svg`);
   assert.equal(response.headers.get('content-type'), 'image/svg+xml');
   assert.match(await response.text(), /<svg/);
 

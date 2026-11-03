@@ -1,8 +1,14 @@
+import { startFire } from './fire.js';
+
 const $ = (id) => document.getElementById(id);
+const fire = startFire($('fire'));
 
 const NAME_KEY = 'scrum-poker:name';
 const CLIENT_KEY = 'scrum-poker:client';
+const PASSWORD_KEY = 'scrum-poker:created-password';
 const MAX_RECONNECT_MS = 8000;
+// 방 화면에서는 카드를 고르는 데 방해되지 않게 불길을 낮춘다.
+const ROOM_FIRE = 0.55;
 
 const storage = {
   get(area, key) {
@@ -44,30 +50,67 @@ async function copyText(text) {
   area.remove();
 }
 
+const LOCK_ICON = '<svg class="lock" viewBox="0 0 16 16" aria-label="비밀번호 필요" role="img"><rect x="3" y="7" width="10" height="8" rx="1.5" fill="currentColor"/><path d="M5 7V5a3 3 0 0 1 6 0v2" fill="none" stroke="currentColor" stroke-width="1.6"/></svg>';
+const ROOM_LIST_REFRESH_MS = 5000;
+
+function showHomeError(message) {
+  $('home-error').textContent = message;
+  $('home-error').hidden = false;
+}
+
+async function refreshRoomList() {
+  let rooms;
+  try {
+    const response = await fetch('/api/rooms');
+    if (!response.ok) return;
+    rooms = await response.json();
+  } catch {
+    return;
+  }
+  $('room-empty').hidden = rooms.length > 0;
+  $('room-list').replaceChildren(...rooms.map((room) => {
+    const item = document.createElement('li');
+    const link = document.createElement('a');
+    link.href = `/r/${room.id}`;
+    const title = document.createElement('span');
+    title.className = 'room-title';
+    title.textContent = room.name;
+    const meta = document.createElement('span');
+    meta.className = 'room-meta';
+    meta.textContent = `${room.participants}명`;
+    link.append(title, meta);
+    if (room.locked) link.insertAdjacentHTML('beforeend', LOCK_ICON);
+    item.append(link);
+    return item;
+  }));
+}
+
 function showHome(missingRoom) {
   $('home').hidden = false;
-  if (missingRoom) {
-    $('home-error').textContent = `${missingRoom}번 방을 찾을 수 없습니다. 방 번호를 확인하거나 새 방을 만드세요.`;
-    $('home-error').hidden = false;
-  }
+  if (missingRoom) showHomeError(`${missingRoom}번 방을 찾을 수 없습니다. 목록에서 다른 방을 고르거나 새 방을 만드세요.`);
 
-  $('create-room').addEventListener('click', async () => {
+  refreshRoomList();
+  setInterval(refreshRoomList, ROOM_LIST_REFRESH_MS);
+
+  $('create-form').addEventListener('submit', async (event) => {
+    event.preventDefault();
     $('create-room').disabled = true;
+    const password = $('room-password').value;
     try {
-      const response = await fetch('/api/rooms', { method: 'POST' });
+      const response = await fetch('/api/rooms', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: $('room-name').value, password }),
+      });
       if (!response.ok) throw new Error(response.statusText);
       const { id } = await response.json();
+      // 방을 만든 사람이 비밀번호를 한 번 더 입력하지 않도록 이 탭에만 잠시 넘겨준다.
+      if (password) storage.set(sessionStorage, `${PASSWORD_KEY}:${id}`, password);
       location.href = `/r/${id}`;
     } catch {
-      $('home-error').textContent = '방을 만들지 못했습니다. 서버 연결을 확인하고 다시 시도하세요.';
-      $('home-error').hidden = false;
+      showHomeError('방을 만들지 못했습니다. 서버 연결을 확인하고 다시 시도하세요.');
       $('create-room').disabled = false;
     }
-  });
-
-  $('enter-room').addEventListener('submit', (event) => {
-    event.preventDefault();
-    location.href = `/r/${$('room-input').value.trim()}`;
   });
 }
 
@@ -77,27 +120,56 @@ async function showRoom(roomId) {
     location.replace(`/?missing=${roomId}`);
     return;
   }
-
-  const name = storage.get(localStorage, NAME_KEY);
-  if (name) {
-    enterRoom(roomId, name);
-    return;
+  const room = await response.json();
+  const savedName = storage.get(localStorage, NAME_KEY);
+  const createdPassword = storage.get(sessionStorage, `${PASSWORD_KEY}:${roomId}`);
+  try {
+    sessionStorage.removeItem(`${PASSWORD_KEY}:${roomId}`);
+  } catch {
+    // 저장소를 쓸 수 없으면 지울 것도 없다.
   }
-  $('name-title').textContent = `${roomId}번 방에 입장`;
-  $('name-view').hidden = false;
-  $('name-input').focus();
+
+  function showEntry(error) {
+    $('room-view').hidden = true;
+    $('name-view').hidden = false;
+    $('name-title').textContent = room.name;
+    $('password-field').hidden = !room.locked;
+    $('password-input').required = room.locked;
+    $('entry-error').textContent = error ?? '';
+    $('entry-error').hidden = !error;
+    const nameFilled = Boolean($('name-input').value.trim());
+    (nameFilled && room.locked ? $('password-input') : $('name-input')).focus();
+  }
+
+  const session = enterRoom(roomId, (triedPassword) => {
+    $('password-input').value = '';
+    // 비밀번호 없이 재접속을 먼저 시도했다 거절된 경우라면 오류 없이 입력만 받는다.
+    showEntry(triedPassword ? '비밀번호가 맞지 않습니다. 다시 입력하세요.' : undefined);
+  });
+
   $('name-form').addEventListener('submit', (event) => {
     event.preventDefault();
-    const entered = $('name-input').value.trim();
-    if (!entered) return;
-    storage.set(localStorage, NAME_KEY, entered);
-    $('name-view').hidden = true;
-    enterRoom(roomId, entered);
+    const name = $('name-input').value.trim();
+    if (!name) return;
+    storage.set(localStorage, NAME_KEY, name);
+    $('entry-error').hidden = true;
+    session.join(name, $('password-input').value);
   });
+
+  $('name-input').value = savedName ?? '';
+  $('password-input').value = createdPassword ?? '';
+  // 이 탭이 이미 방에 있던 참가자라면 서버가 비밀번호 없이 재접속을 받아준다.
+  const mayBeMember = Boolean(storage.get(sessionStorage, CLIENT_KEY));
+  if (savedName && (!room.locked || createdPassword || mayBeMember)) {
+    session.join(savedName, createdPassword ?? '');
+  } else {
+    showEntry();
+  }
 }
 
-function enterRoom(roomId, initialName) {
-  let name = initialName;
+function enterRoom(roomId, onDenied) {
+  let name = '';
+  let password = '';
   let socket = null;
   let attempts = 0;
   let leaving = false;
@@ -115,15 +187,22 @@ function enterRoom(roomId, initialName) {
     socket.addEventListener('open', () => {
       attempts = 0;
       $('banner').hidden = true;
-      send({ type: 'join', clientId: clientId(), name });
+      send({ type: 'join', clientId: clientId(), name, password });
     });
     socket.addEventListener('message', (event) => {
       state = JSON.parse(event.data);
+      $('name-view').hidden = true;
+      $('room-view').hidden = false;
+      fire.setIntensity(ROOM_FIRE);
       render();
     });
     socket.addEventListener('close', (event) => {
       if (leaving) {
         location.href = '/';
+        return;
+      }
+      if (event.code === 4003) {
+        onDenied(password);
         return;
       }
       if (event.code === 4004) {
@@ -231,7 +310,7 @@ function enterRoom(roomId, initialName) {
 
   function renderSide() {
     const { room, you } = state;
-    $('room-label').textContent = `방 ${room.id}`;
+    $('room-label').textContent = room.name;
     $('room-number').textContent = room.id;
     $('join-url').textContent = room.joinUrl;
     $('join-url').href = room.joinUrl;
@@ -302,8 +381,16 @@ function enterRoom(roomId, initialName) {
   });
 
   $('qr').src = `/qr/${roomId}.svg`;
-  $('room-view').hidden = false;
-  connect();
+
+  return {
+    join(enteredName, enteredPassword) {
+      // 입장 버튼을 연달아 눌러도 연결은 하나만 연다.
+      if (socket && socket.readyState !== WebSocket.CLOSED) return;
+      name = enteredName;
+      password = enteredPassword;
+      connect();
+    },
+  };
 }
 
 const roomMatch = location.pathname.match(/^\/r\/(\d{4})$/);
